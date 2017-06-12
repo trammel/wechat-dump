@@ -1,7 +1,7 @@
 #!/usr/bin/env python2
 # -*- coding: UTF-8 -*-
 # File: libchathelper.py
-# Date: Fri Mar 27 22:25:14 2015 +0800
+# Date: Thu Jun 18 00:02:35 2015 +0800
 # Author: Yuxin Wu <ppwwyyxxc@gmail.com>
 
 import base64
@@ -12,13 +12,14 @@ logger = logging.getLogger(__name__)
 
 from libchat.libchat import SqliteLibChat, ChatMsg
 from .msg import *
-from .utils import timing, ProgressReporter
+from common.timer import timing
+from common.progress import ProgressReporter
 
 class LibChatHelper(object):
     """ Build LibChat messages from WeChat Msg"""
 
     """ Types of message whose contents are fully parsed.
-    No need to save extra data for them. """
+        No need to save extra data for them. """
     FullyParsed = [TYPE_MSG, TYPE_SPEAK, TYPE_EMOJI,
                     TYPE_CUSTOM_EMOJI, TYPE_IMG]
 
@@ -45,15 +46,7 @@ class LibChatHelper(object):
             return img, 'jpeg'
         elif msg.type == TYPE_EMOJI:
             md5 = msg.imgPath
-            if md5 in self.parser.internal_emojis:
-                emoji_img, format = self.res.get_internal_emoji(
-                    self.parser.internal_emojis[md5])
-            else:
-                if md5 in self.parser.emojis:
-                    group, _ = self.parser.emojis[md5]
-                else:
-                    group = None
-                emoji_img, format = self.res.get_emoji(md5, group)
+            emoji_img, format = self.res.get_emoji_by_md5(md5)
             return emoji_img, format
         elif msg.type == TYPE_CUSTOM_EMOJI:
             pq = PyQuery(msg.content)
@@ -77,9 +70,9 @@ class LibChatHelper(object):
         return json.dumps(ret)
 
     def _convert_msg(self, msg):
-        sender = 'me' if msg.isSend else msg.get_msg_talker_id()
+        sender = 'me' if msg.isSend else msg.talker
         chatroom = msg.get_chatroom()
-        text = msg.content_no_first_line if msg.type == TYPE_MSG else ''
+        text = msg.content if msg.type == TYPE_MSG else ''
         img, format = self._get_image(msg)
         if img:
             # TODO don't use b64, directly return image content
@@ -94,7 +87,7 @@ class LibChatHelper(object):
             text, img, sound, extra)
 
     def convert_msgs(self, msgs):
-        self.prgs = ProgressReporter("Convert", total=len(msgs))
+        self.prgs = ProgressReporter("Parse Messages", total=len(msgs))
         ret = [self._convert_msg(m) for m in msgs]
         self.prgs.finish()
         return ret

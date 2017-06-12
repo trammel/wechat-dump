@@ -1,17 +1,18 @@
 #!/usr/bin/env python2
 # -*- coding: UTF-8 -*-
 # File: parser.py
-# Date: Wed Jan 07 23:29:50 2015 +0800
+# Date: Thu Jun 18 00:03:53 2015 +0800
 # Author: Yuxin Wu <ppwwyyxxc@gmail.com>
 
 import sqlite3
 from collections import defaultdict
 import itertools
+from datetime import datetime
 import logging
 logger = logging.getLogger(__name__)
 
-from .msg import WeChatMsg
-from .utils import ensure_unicode
+from .msg import WeChatMsg, TYPE_SYSTEM
+from common.textutil import ensure_unicode
 
 """ tables in concern:
 emojiinfo
@@ -23,14 +24,18 @@ rcontact
 """
 
 class WeChatDBParser(object):
+    FIELDS = ["msgSvrId","type","isSend","createTime","talker","content","imgPath"]
+
     def __init__(self, db_fname):
-        """ db_fname: EnMicroMsg.db"""
+        """ db_fname: a decrypted EnMicroMsg.db"""
         self.db_fname = db_fname
         self.db_conn = sqlite3.connect(self.db_fname)
         self.cc = self.db_conn.cursor()
-        self.contacts = {}
-        self.msgs_by_talker = defaultdict(list)
-        self.emojis = {}
+        self.contacts = {}      # username -> nickname
+        self.contacts_rev = defaultdict(list)
+        self.msgs_by_chat = defaultdict(list)
+        self.emoji_groups = {}
+        self.emoji_url = {}
         self.internal_emojis = {}
         self._parse()
 
@@ -46,25 +51,27 @@ SELECT username,conRemark,nickname FROM rcontact
             else:
                 self.contacts[username] = ensure_unicode(nickname)
 
-        logger.info("Found {} contacts.".format(len(self.contacts)))
+        for k, v in self.contacts.iteritems():
+            self.contacts_rev[v].append(k)
+        logger.info("Found {} names in `contact` table.".format(len(self.contacts)))
 
     def _parse_msg(self):
         msgs_tot_cnt = 0
         db_msgs = self.cc.execute(
 """
 SELECT {} FROM message
-""".format(','.join(WeChatMsg.FIELDS)))
+""".format(','.join(WeChatDBParser.FIELDS)))
         for row in db_msgs:
-            msg = WeChatMsg(row)
+            values = self._parse_msg_row(row)
+            if not values:
+                continue
+            msg = WeChatMsg(values)
+            # TODO keep system message?
             if not WeChatMsg.filter_type(msg.type):
-                self.msgs_by_talker[msg.talker].append(msg)
-            #if msg.type > 10000 or msg.type < 0:
-                #print repr(msg).split('|')[0]
-        self.msgs_by_talker = {self.contacts[k]: sorted(v, key=lambda x: x.createTime)
-                           for k, v in self.msgs_by_talker.iteritems()}
-        for k, v in self.msgs_by_talker.iteritems():
-            for msg in v:
-                msg.talker_name = ensure_unicode(k)
+                self.msgs_by_chat[msg.chat].append(msg)
+
+        for k, v in self.msgs_by_chat.iteritems():
+            self.msgs_by_chat[k] = sorted(v, key=lambda x: x.createTime)
             msgs_tot_cnt += len(v)
         logger.info("Found {} message records.".format(msgs_tot_cnt))
 
@@ -83,7 +90,7 @@ SELECT {} FROM message
     def _find_msg_by_type(self, msgs=None):
         ret = []
         if msgs is None:
-            msgs = itertools.chain.from_iterable(self.msgs_by_talker.itervalues())
+            msgs = itertools.chain.from_iterable(self.msgs_by_chat.itervalues())
         for msg in msgs:
             if msg.type == 34:
                 ret.append(msg)
@@ -92,16 +99,18 @@ SELECT {} FROM message
     def _parse_emoji(self):
         # wechat provided emojis
         emojiinfo_q = self.cc.execute(
-""" SELECT md5, desc, groupid FROM EmojiInfoDesc """)
+""" SELECT md5, groupid FROM EmojiInfoDesc """)
         for row in emojiinfo_q:
-            md5, desc, group = row
-            self.emojis[md5] = (group, desc)
+            md5, group = row
+            self.emoji_groups[md5] = group
 
         NEEDED_EMOJI_CATALOG = [49, 50, 17]
         emojiinfo_q = self.cc.execute(
-""" SELECT md5, catalog, name FROM EmojiInfo WHERE name <> ''""")
+""" SELECT md5, catalog, name, cdnUrl FROM EmojiInfo""")
         for row in emojiinfo_q:
-            md5, catalog, name = row
+            md5, catalog, name, cdnUrl = row
+            if cdnUrl:
+                self.emoji_url[md5] = cdnUrl
             if catalog not in NEEDED_EMOJI_CATALOG:
                 continue
             self.internal_emojis[md5] = name
@@ -113,3 +122,56 @@ SELECT {} FROM message
         self._parse_msg()
         self._parse_imginfo()
         self._parse_emoji()
+
+    # process the values in a row
+    def _parse_msg_row(self, row):
+        """ parse a record of message into my format"""
+        values = dict(zip(WeChatDBParser.FIELDS, row))
+        if values['content']:
+            values['content'] = ensure_unicode(values['content'])
+        else:
+            values['content'] = u''
+        values['createTime'] = datetime.fromtimestamp(values['createTime']/ 1000)
+        values['chat'] = values['talker']
+        try:
+            if values['chat'].endswith('@chatroom'):
+                values['chat_nickname'] = self.contacts[values['chat']]
+                content = values['content']
+
+                if values['isSend'] == 1:
+                    values['talker'] = self.username
+                elif values['type'] == TYPE_SYSTEM:
+                    values['talker'] = u'SYSTEM'
+                else:
+                    talker = content[:content.find(':')]
+                    values['talker'] = talker
+                    values['talker_nickname'] = self.contacts.get(talker, talker)
+
+                values['content'] = content[content.find('\n') + 1:]
+            else:
+                tk_id = values['talker']
+                values['chat'] = tk_id
+                values['chat_nickname'] = self.contacts[tk_id]
+                values['talker'] = tk_id
+                values['talker_nickname'] = self.contacts[tk_id]
+        except KeyError:
+            # It's possible that messages are kept in database after contacts been deleted
+            logger.warn("Unknown contact: {}".format(values.get('talker', '')))
+            return None
+        return values
+
+    @property
+    def all_chat_ids(self):
+        return self.msgs_by_chat.keys()
+
+    @property
+    def all_chat_nicknames(self):
+        return [self.contacts[k] for k in self.all_chat_ids]
+
+    def get_id_by_nickname(self, nickname):
+        l = self.contacts_rev[nickname]
+        if len(l) == 0:
+            raise KeyError("No contacts have nickname {}".format(nickname))
+        if len(l) > 1:
+            logger.warn("More than one contacts have nickname {}! Using the first contact".format(nickname))
+        return l[0]

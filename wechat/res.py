@@ -1,7 +1,7 @@
 #!/usr/bin/env python2
 # -*- coding: UTF-8 -*-
 # File: res.py
-# Date: Sun Apr 19 17:11:07 2015 +0800
+# Date: Thu Jun 18 00:02:21 2015 +0800
 # Author: Yuxin Wu <ppwwyyxxc@gmail.com>
 
 import glob
@@ -15,58 +15,72 @@ import logging
 logger = logging.getLogger(__name__)
 import imghdr
 from multiprocessing import Pool
-
-import pysox
+import atexit
+import cPickle as pickle
+import requests
 
 from .avatar import AvatarReader
-from .utils import timing, md5, get_file_b64
+from common.textutil import md5, get_file_b64
+from common.timer import timing
 from .msg import TYPE_SPEAK
+from .audio import parse_wechat_audio_file
 
 LIB_PATH = os.path.dirname(os.path.abspath(__file__))
 INTERNAL_EMOJI_DIR = os.path.join(LIB_PATH, 'static', 'internal_emoji')
 VOICE_DIRNAME = 'voice2'
 IMG_DIRNAME = 'image2'
 EMOJI_DIRNAME = 'emoji'
-AVATAR_DIRNAME = 'avatar'
+AVATAR_DIRNAME = 'sfs'
 
 JPEG_QUALITY = 50
 
-def do_get_voice_mp3(amr_fpath):
-    """ return base64 string, and voice duration"""
-    try:
-        if not amr_fpath: return "", 0
-        mp3_file = os.path.join('/tmp',
-                                os.path.basename(amr_fpath)[:-4] + '.mp3')
+class EmojiCache(object):
+    def __init__(self, fname):
+        self.fname = fname
+        if os.path.isfile(fname):
+            self.dic = pickle.load(open(fname))
+        else:
+            self.dic = {}
 
-        infile = pysox.CSoxStream(amr_fpath)
-        outfile = pysox.CSoxStream(mp3_file, 'w', infile.get_signal())
-        chain = pysox.CEffectsChain(infile, outfile)
-        chain.flow_effects()
-        outfile.close()
+    def query(self, md5):
+        return self.dic.get(md5, (None, None))
 
-        signal = infile.get_signal().get_signalinfo()
-        duration = signal['length'] * 1.0 / signal['rate']
-        mp3_string = get_file_b64(mp3_file)
-        os.unlink(mp3_file)
-    except:
-        logger.warn("Failed to prepare voice file. Wechat changed their protocol!")
-        return 'fail', 0.1
-    return mp3_string, duration
+    def fetch(self, md5, url):
+        try:
+            logger.info("Requesting emoji {} from {} ...".format(md5, url))
+            r = requests.get(url).content
+            im = Image.open(cStringIO.StringIO(r))
+            format = im.format.lower()
+            ret = (base64.b64encode(r), format)
+            self.dic[md5] = ret
+            self.flush()
+            return ret
+        except Exception as e:
+            logger.exception("Error processing emoji from {}".format(url))
+            return None, None
+
+    def flush(self):
+        with open(self.fname, 'wb') as f:
+            pickle.dump(self.dic, f)
 
 class Resource(object):
     """ multimedia resources in chat"""
-    def __init__(self, res_dir):
+    def __init__(self, parser, res_dir, avt_db):
         def check(subdir):
             assert os.path.isdir(os.path.join(res_dir, subdir)), \
                     "No such directory: {}".format(subdir)
         [check(k) for k in ['', AVATAR_DIRNAME, IMG_DIRNAME, EMOJI_DIRNAME, VOICE_DIRNAME]]
 
+        self.emoji_cache = EmojiCache(
+                os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                    '..', 'emoji.cache'))
         self.res_dir = res_dir
+        self.parser = parser
         self.voice_cache_idx = {}
         self.img_dir = os.path.join(res_dir, IMG_DIRNAME)
         self.voice_dir = os.path.join(res_dir, VOICE_DIRNAME)
         self.emoji_dir = os.path.join(res_dir, EMOJI_DIRNAME)
-        self.avt_reader = AvatarReader(os.path.join(res_dir, AVATAR_DIRNAME))
+        self.avt_reader = AvatarReader(os.path.join(res_dir, AVATAR_DIRNAME), avt_db)
 
     def get_voice_filename(self, imgpath):
         fname = md5(imgpath)
@@ -82,7 +96,7 @@ class Resource(object):
         """ return mp3 and duration, or empty string and 0 on failure"""
         idx = self.voice_cache_idx.get(imgpath)
         if idx is None:
-            return do_get_voice_mp3(
+            return parse_wechat_audio_file(
                 self.get_voice_filename(imgpath))
         return self.voice_cache[idx].get()
 
@@ -92,20 +106,27 @@ class Resource(object):
         voice_paths = [msg.imgPath for msg in msgs if msg.type == TYPE_SPEAK]
         self.voice_cache_idx = {k: idx for idx, k in enumerate(voice_paths)}
         pool = Pool(3)
-        self.voice_cache = [pool.apply_async(do_get_voice_mp3,
+        atexit.register(lambda x: x.terminate(), pool)
+        self.voice_cache = [pool.apply_async(parse_wechat_audio_file,
                                              (self.get_voice_filename(k),)) for k in voice_paths]
 # single-threaded version, for debug
-        #self.voice_cache = map(do_get_voice_mp3,
+        #self.voice_cache = map(parse_wechat_audio_file,
                              #(self.get_voice_filename(k) for k in voice_paths))
 
     def get_avatar(self, username):
         """ return base64 string"""
-        ret = self.avt_reader.get_avatar(username)
-        if ret is None:
+        im = self.avt_reader.get_avatar(username)
+        if im is None:
             return ""
-        im = Image.fromarray(ret)
         buf = cStringIO.StringIO()
-        im.save(buf, 'JPEG', quality=JPEG_QUALITY)
+        try:
+            im.save(buf, 'JPEG', quality=JPEG_QUALITY)
+        except IOError:
+            try:
+                # sometimes it works the second time...
+                im.save(buf, 'JPEG', quality=JPEG_QUALITY)
+            except IOError:
+                return ""
         jpeg_str = buf.getvalue()
         return base64.b64encode(jpeg_str)
 
@@ -150,7 +171,10 @@ class Resource(object):
 
 
     def get_img(self, fnames):
-        """ return two base64 jpg string"""
+        """
+        :params fnames: possible file paths
+        :returns: two base64 jpg string
+        """
         fnames = [k for k in fnames if k]   # filter out empty string
         big_file, small_file = self._get_img_file(fnames)
 
@@ -161,7 +185,7 @@ class Resource(object):
                imghdr.what(img_file) != 'jpeg':
                 im = Image.open(open(img_file, 'rb'))
                 buf = cStringIO.StringIO()
-                im.save(buf, 'JPEG', quality=JPEG_QUALITY)
+                im.convert('RGB').save(buf, 'JPEG', quality=JPEG_QUALITY)
                 return base64.b64encode(buf.getvalue())
             return get_file_b64(img_file)
         big_file = get_jpg_b64(big_file)
@@ -169,28 +193,55 @@ class Resource(object):
             return big_file
         return get_jpg_b64(small_file)
 
-    def get_emoji(self, md5, pack_id):
+    def _get_res_emoji(self, md5, pack_id):
         path = self.emoji_dir
         if pack_id:
             path = os.path.join(path, pack_id)
         candidates = glob.glob(os.path.join(path, '{}*'.format(md5)))
-        candidates = [k for k in candidates if \
-                      not k.endswith('_thumb') and not k.endswith('_cover')]
-        if len(candidates) > 1:
-            # annimation
-            candidates = [k for k in candidates if not re.match('.*_[0-9]+$', k)]
-            # only one file is the gif in need, others are frames or cover
-            if len(candidates) == 0:
-                # TODO stitch frames to gif
-                logger.warning("Cannot find emoji: {}".format(md5))
-                return None, None
-        if not candidates:
-            return None, None
-        fname = candidates[0]
-        return get_file_b64(fname), imghdr.what(fname)
+        candidates = [k for k in candidates if not k.endswith('_thumb') \
+                and not re.match('.*_[0-9]+$', k)]
 
-    def get_internal_emoji(self, fname):
+        def try_use(f):
+            if not f: return None
+            if not imghdr.what(f[0]):   # cannot recognize file type
+                return None
+            return f[0]
+
+        f = try_use([k for k in candidates if not k.endswith('_cover')])
+        if f:
+            return get_file_b64(f), imghdr.what(f)
+
+        # don't try do use cover anymore. cover is not animated
+        #f = try_use([k for k in candidates if k.endswith('_cover')])
+        #if f:
+            #return get_file_b64(f), imghdr.what(f)
+        return None, None
+
+    def _get_internal_emoji(self, fname):
         f = os.path.join(INTERNAL_EMOJI_DIR, fname)
         return get_file_b64(f), imghdr.what(f)
+
+    def get_emoji_by_md5(self, md5):
+        """ :returns: (b64 img, format)"""
+        if md5 in self.parser.internal_emojis:
+            emoji_img, format = self._get_internal_emoji(self.parser.internal_emojis[md5])
+            logger.warn("Cannot get emoji {}".format(md5))
+            return None, None
+        else:
+            img, format = self.emoji_cache.query(md5)
+            if format:
+                return img, format
+            group = self.parser.emoji_groups.get(md5, None)
+            emoji_img, format = self._get_res_emoji(md5, group)
+            if format:
+                return emoji_img, format
+            url = self.parser.emoji_url.get(md5, None)
+            if url:
+                emoji_img, format = self.emoji_cache.fetch(md5, url)
+                if format:
+                    return emoji_img, format
+
+            logger.warn("Cannot get emoji {} in {}".format(md5, group))
+            return None, None
 
 

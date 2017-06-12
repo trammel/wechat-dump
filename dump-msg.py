@@ -1,10 +1,11 @@
 #!/usr/bin/env python2
 # -*- coding: UTF-8 -*-
-# File: dump_msg.py
-# Date: Wed Mar 25 17:44:34 2015 +0800
+# File: dump-msg.py
+# Date: Mon May 25 15:23:05 2015 +0800
 # Author: Yuxin Wu <ppwwyyxxc@gmail.com>
 
 from wechat.parser import WeChatDBParser
+from common.textutil import safe_filename
 import sys, os
 
 if len(sys.argv) != 3:
@@ -21,8 +22,17 @@ if not os.path.isdir(output_dir):
 
 parser = WeChatDBParser(db_file)
 
-for name, msgs in parser.msgs_by_talker.iteritems():
+for chatid, msgs in parser.msgs_by_chat.iteritems():
+    name = parser.contacts[chatid]
+    if len(name) == 0:
+        print u"Chat {} doesn't have a valid display name".format(chatid)
+        name = str(id(chatid))
     print u"Writing msgs for {}".format(name)
-    with open(os.path.join(output_dir, name + '.txt'), 'w') as f:
+    safe_name = safe_filename(name)
+    outf = os.path.join(output_dir, safe_name + '.txt')
+    if os.path.isfile(outf):
+        print(u"File {} exists! Skip contact {}".format(outf, name))
+        continue
+    with open(outf, 'w') as f:
         for m in msgs:
             print >> f, m

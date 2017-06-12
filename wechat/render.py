@@ -1,7 +1,7 @@
 #!/usr/bin/env python2
 # -*- coding: UTF-8 -*-
 # File: render.py
-# Date: Fri Mar 27 23:41:46 2015 +0800
+# Date: Thu Jun 18 00:03:10 2015 +0800
 # Author: Yuxin Wu <ppwwyyxxc@gmail.com>
 
 import os
@@ -23,7 +23,9 @@ except ImportError:
     css_compress = lambda x: x
 
 from .msg import *
-from .utils import ensure_unicode, ProgressReporter, pmap, timing
+from common.textutil import ensure_unicode
+from common.progress import ProgressReporter
+from common.timer import timing
 from .smiley import SmileyProvider
 from .msgslice import MessageSlicerByTime, MessageSlicerBySize
 
@@ -42,8 +44,8 @@ class HTMLRender(object):
         self.time_html = open(TIME_HTML_FILE).read()
         self.parser = parser
         self.res = res
-        if self.res is None:
-            logger.warn("Resource Directory not given. Images / Voice Message won't be displayed.")
+        assert self.res is not None, \
+            "Resource Directory not given. Cannot render HTML."
         self.smiley = SmileyProvider()
 
         css_files = glob.glob(os.path.join(LIB_PATH, 'static/*.css'))
@@ -55,7 +57,7 @@ class HTMLRender(object):
 
         js_files = glob.glob(os.path.join(LIB_PATH, 'static/*.js'))
         # to load jquery before other js
-        js_files = sorted(js_files, key=lambda f: 'jquery' in f, reverse=True)
+        js_files = sorted(js_files, key=lambda f: 'jquery-latest' in f, reverse=True)
         self.js_string = []
         for js in js_files:
             logger.info("Loading {}".format(os.path.basename(js)))
@@ -90,7 +92,7 @@ class HTMLRender(object):
     def render_msg(self, msg):
         """ render a message, return the html block"""
         # TODO for chatroom, add nickname on avatar
-        sender = u'you ' + msg.get_msg_talker_id() if not msg.isSend else 'me'
+        sender = u'you ' + msg.talker if not msg.isSend else 'me'
         format_dict = {'sender_label': sender,
                        'time': msg.createTime }
         def fallback():
@@ -122,21 +124,14 @@ class HTMLRender(object):
             return template.format(**format_dict)
         elif msg.type == TYPE_EMOJI:
             md5 = msg.imgPath
-            if md5 in self.parser.internal_emojis:
-                emoji_img, format = self.res.get_internal_emoji(self.parser.internal_emojis[md5])
-            else:
-                if md5 in self.parser.emojis:
-                    group, _ = self.parser.emojis[md5]
-                else:
-                    group = None
-                emoji_img, format = self.res.get_emoji(md5, group)
+            emoji_img, format = self.res.get_emoji_by_md5(md5)
             format_dict['emoji_format'] = format
             format_dict['emoji_img'] = emoji_img
             return template.format(**format_dict)
         elif msg.type == TYPE_CUSTOM_EMOJI:
             pq = PyQuery(msg.content)
             md5 = pq('emoticonmd5').text()
-            format_dict['img'] = self.res.get_emoji(md5, None)
+            format_dict['img'] = self.res.get_emoji_by_md5(md5)
             return template.format(**format_dict)
         elif msg.type == TYPE_LINK:
             content = msg.msg_str()
@@ -172,7 +167,7 @@ class HTMLRender(object):
         # string operation is extremely slow
         return self.html.format(extra_css=self.all_css,
                             extra_js=self.all_js,
-                            talker=msgs[0].talker_name,
+                            chat=msgs[0].chat_nickname,
                             messages=u''.join(blocks)
                            )
 
@@ -187,20 +182,18 @@ class HTMLRender(object):
         self.css_string.append(css)
 
     def render_msgs(self, msgs):
-        """ render msgs of one friend, return a list of html"""
-        talker_id = msgs[0].talker
+        """ render msgs of one chat, return a list of html"""
         if msgs[0].is_chatroom():
-            talkers = set()
-            for msg in msgs:
-                talkers.add(msg.get_msg_talker_id())
+            talkers = set([m.talker for m in msgs])
         else:
-            talkers = set([talker_id])
+            talkers = set([msgs[0].talker])
         self.prepare_avatar_css(talkers)
 
         self.res.cache_voice_mp3(msgs)
 
-        logger.info(u"Rendering {} messages of {}({})".format(
-            len(msgs), self.parser.contacts[talker_id], talker_id))
+        chat = msgs[0].chat_nickname
+        logger.info(u"Rendering {} messages of {}".format(
+            len(msgs), chat))
 
         self.prgs = ProgressReporter("Render", total=len(msgs))
         slice_by_size = MessageSlicerBySize().slice(msgs)

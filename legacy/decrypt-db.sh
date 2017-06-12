@@ -1,6 +1,6 @@
 #!/bin/bash -e
-# File: decrypt_db.sh
-# Date: Sun Feb 01 17:30:29 2015 +0800
+# File: decrypt-db.sh
+# Date: Tue Jun 16 22:23:13 2015 +0800
 # Author: Yuxin Wu <ppwwyyxxc@gmail.com>
 
 source compatibility.sh
@@ -29,15 +29,16 @@ uname | grep Darwin > /dev/null && os=darwin || os=linux
 uname -m | grep x86_64 > /dev/null && version=64bit || version=32bit
 echo "Use $version sqlcipher of $os."
 
-echo "Dump decrypted database... "
-echo "Don't worry about libcrypt.so version warning."
+echo "Dump decrypted database... (Don't worry about libcrypt.so version warning.)"
 
 
 SQLCIPHER=./sqlcipher/$os/$version
 export LD_LIBRARY_PATH=$SQLCIPHER
-$SQLCIPHER/sqlcipher $MSGDB << EOF
+"$SQLCIPHER"/sqlcipher "$MSGDB" << EOF
 PRAGMA key='$KEY';
 PRAGMA cipher_use_hmac = off;
+PRAGMA cipher_page_size = 1024;
+PRAGMA kdf_iter = 4000;
 ATTACH DATABASE "$output" AS db KEY "";
 SELECT sqlcipher_export("db");
 DETACH DATABASE db;
